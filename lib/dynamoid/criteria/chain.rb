@@ -118,7 +118,6 @@ module Dynamoid #:nodoc:
       end
 
       def batch(batch_size)
-        raise 'Cannot batch calls when using partitioning' if Dynamoid::Config.partitioning?
         @batch_size = batch_size
         self
       end
