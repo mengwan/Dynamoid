@@ -112,6 +112,13 @@ class User
 end
 ```
 
+You can optionally set a default value on a field using either a plain value or a lambda:
+
+```ruby
+  field :actions_taken, :integer, {default: 0}
+  field :joined_at, :datetime, {default: ->(){Time.now}}
+```
+
 ### Associations
 
 Just like in ActiveRecord (or your other favorite ORM), Dynamoid uses associations to create links between models.
