@@ -5,27 +5,48 @@ module Dynamoid
   # 1) For the rest of Dynamoid, the gateway to DynamoDB.
   # 2) Allows switching `config.adapter` to ease development of a new adapter.
   # 3) Caches the list of tables Dynamoid knows about.
-  module Adapter
-    def self.tables
-      @tables
+  class Adapter
+    # MUTEX RULE:
+    # `@tables_mutex` must always be acquired before `@adapter_mutex`!
+    # This is mandated by how `#tables` works: while holding `@tables_mutex`, it
+    # needs `#adapter` to list tables.
+
+    def initialize
+      @adapter_mutex = Mutex.new
+      @tables_mutex = Mutex.new
     end
 
-    # The actual adapter currently in use: presently AwsSdk.
-    #
-    # @since 0.2.0
-    def self.adapter
-      reconnect! unless @adapter
-      @adapter
+    def tables
+      if !@tables_
+        @tables_mutex.synchronize do
+          if !@tables_
+            @tables_ = benchmark('Cache Tables') {list_tables}
+          end
+        end
+      end
+      @tables_
     end
 
-    # Establishes a connection to the underyling adapter and caches all its tables for speedier future lookups. Issued when the adapter is first called.
+    # The actual adapter currently in use.
     #
     # @since 0.2.0
-    def self.reconnect!
-      require "dynamoid/adapter/#{Dynamoid::Config.adapter}" unless Dynamoid::Adapter.const_defined?(Dynamoid::Config.adapter.camelcase)
-      @adapter = Dynamoid::Adapter.const_get(Dynamoid::Config.adapter.camelcase).new
-      @adapter.connect! if @adapter.respond_to?(:connect!)
-      @tables = benchmark('Cache Tables') {list_tables}
+    def adapter
+      if !@adapter_
+        @adapter_mutex.synchronize do
+          if !@adapter_
+            adapter = self.class.adapter_plugin_class.new
+            adapter.connect! if adapter.respond_to?(:connect!)
+            @adapter_ = adapter
+          end
+        end
+      end
+      @adapter_
+    end
+
+    def clear_cache!
+      @tables_mutex.synchronize do
+        @tables_ = nil
+      end
     end
 
     # Shows how long it takes a method to run on the adapter. Useful for generating logged output.
@@ -37,7 +58,7 @@ module Dynamoid
     # @return the result of the yield
     #
     # @since 0.2.0
-    def self.benchmark(method, *args)
+    def benchmark(method, *args)
       start = Time.now
       result = yield
       Dynamoid.logger.info "(#{((Time.now - start) * 1000.0).round(2)} ms) #{method.to_s.split('_').collect(&:upcase).join(' ')}#{ " - #{args.inspect}" unless args.nil? || args.empty? }"
@@ -53,7 +74,7 @@ module Dynamoid
     # @return [Object] the persisted object
     #
     # @since 0.2.0
-    def self.write(table, object, options = nil)
+    def write(table, object, options = nil)
       put_item(table, object, options)
     end
 
@@ -69,7 +90,7 @@ module Dynamoid
     #                        unless multiple ids are passed in.
     #
     # @since 0.2.0
-    def self.read(table, ids, options = {})
+    def read(table, ids, options = {})
       range_key = options.delete(:range_key)
 
       if ids.respond_to?(:each)
@@ -87,7 +108,7 @@ module Dynamoid
     # @param [Array] ids to delete, can also be a string of just one id
     # @param [Array] range_key of the record to delete, can also be a string of just one range_key
     #
-    def self.delete(table, ids, options = {})
+    def delete(table, ids, options = {})
       range_key = options[:range_key] #array of range keys that matches the ids passed in
       if ids.respond_to?(:each)
         if range_key.respond_to?(:each)
@@ -109,11 +130,11 @@ module Dynamoid
     # @param [Hash] scan_hash a hash of attributes: matching records will be returned by the scan
     #
     # @since 0.2.0
-    def self.scan(table, query, opts = {})
+    def scan(table, query, opts = {})
       benchmark('Scan', table, query) {adapter.scan(table, query, opts)}
     end
 
-    def self.create_table(table_name, key, options = {})
+    def create_table(table_name, key, options = {})
       if !tables.include?(table_name)
         benchmark('Create Table') { adapter.create_table(table_name, key, options) }
         tables << table_name
@@ -124,7 +145,7 @@ module Dynamoid
       # Method delegation with benchmark to the underlying adapter. Faster than relying on method_missing.
       #
       # @since 0.2.0
-      define_singleton_method(m) do |*args|
+      define_method(m) do |*args|
         benchmark("#{m.to_s}", args) {adapter.send(m, *args)}
       end
     end
@@ -132,8 +153,8 @@ module Dynamoid
     # Delegate all methods that aren't defind here to the underlying adapter.
     #
     # @since 0.2.0
-    def self.method_missing(method, *args, &block)
-      return benchmark(method, *args) {adapter.send(method, *args, &block)} if @adapter.respond_to?(method)
+    def method_missing(method, *args, &block)
+      return benchmark(method, *args) {adapter.send(method, *args, &block)} if adapter.respond_to?(method)
       super
     end
 
@@ -152,8 +173,19 @@ module Dynamoid
     #
     # @return [Array] an array of all matching items
     #
-    def self.query(table_name, opts = {})
-      @adapter.query(table_name, opts)
+    def query(table_name, opts = {})
+      adapter.query(table_name, opts)
     end
+
+    private
+
+    def self.adapter_plugin_class
+      unless Dynamoid.const_defined?(:AdapterPlugin) && Dynamoid::AdapterPlugin.const_defined?(Dynamoid::Config.adapter.camelcase)
+        require "dynamoid/adapter_plugin/#{Dynamoid::Config.adapter}"
+      end
+
+      Dynamoid::AdapterPlugin.const_get(Dynamoid::Config.adapter.camelcase)
+    end
+
   end
 end
